@@ -20,12 +20,26 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type LocationInfo struct {
+	IP       string `json:"ip"`
+	Hostname string `json:"hostname,omitempty"`
+	City     string `json:"city,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Loc      string `json:"loc,omitempty"` // Latitude,Longitude
+	Org      string `json:"org,omitempty"`
+	Postal   string `json:"postal,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+	Anycast  bool   `json:"anycast,omitempty"`
+}
+
 type SubdomainResult struct {
-	Subdomain   string   `json:"subdomain"`
-	IPAddresses []string `json:"ip_addresses"`
-	StatusCode  int      `json:"status_code"`
-	IsAlive     bool     `json:"is_alive"`
-	Environment string   `json:"environment"` // prod, staging, dev, etc.
+	Subdomain   string                  `json:"subdomain"`
+	IPAddresses []string                `json:"ip_addresses"`
+	IPLocations map[string]LocationInfo `json:"ip_locations,omitempty"` // IP -> LocationInfo
+	StatusCode  int                     `json:"status_code"`
+	IsAlive     bool                    `json:"is_alive"`
+	Environment string                  `json:"environment"` // prod, staging, dev, etc.
 }
 
 type Discovery struct {
@@ -103,8 +117,16 @@ func (d *Discovery) checkSubdomain(ctx context.Context, subdomain string) {
 	result := SubdomainResult{
 		Subdomain:   subdomain,
 		IPAddresses: ips,
+		IPLocations: make(map[string]LocationInfo),
 		IsAlive:     false,
 		Environment: d.detectEnvironment(subdomain),
+	}
+
+	// Fetch location information for each IP
+	for _, ip := range ips {
+		if locInfo := d.fetchIPLocation(ctx, ip); locInfo != nil {
+			result.IPLocations[ip] = *locInfo
+		}
 	}
 
 	// HTTP probe to check if alive
@@ -142,6 +164,45 @@ func (d *Discovery) probeHTTP(subdomain string, result *SubdomainResult) bool {
 		}
 	}
 	return false
+}
+
+func (d *Discovery) fetchIPLocation(ctx context.Context, ip string) *LocationInfo {
+	// Use ipinfo.io free API (no auth required for basic usage)
+	url := fmt.Sprintf("https://ipinfo.io/%s/json", ip)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil // Silently fail if location lookup fails
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	var locInfo LocationInfo
+	if err := json.NewDecoder(resp.Body).Decode(&locInfo); err != nil {
+		return nil
+	}
+
+	// Ensure IP is set (some APIs don't return it)
+	if locInfo.IP == "" {
+		locInfo.IP = ip
+	}
+
+	return &locInfo
 }
 
 func (d *Discovery) detectEnvironment(subdomain string) string {
@@ -601,6 +662,37 @@ func (d *Discovery) printResults() {
 				status = fmt.Sprintf("UP (%d)", r.StatusCode)
 			}
 			fmt.Printf("  %-40s %-15s %s\n", r.Subdomain, status, strings.Join(r.IPAddresses, ", "))
+
+			// Show location info if available
+			if len(r.IPLocations) > 0 {
+				for ip, loc := range r.IPLocations {
+					locationStr := ""
+					if loc.City != "" && loc.Region != "" {
+						locationStr = fmt.Sprintf("%s, %s", loc.City, loc.Region)
+					} else if loc.City != "" {
+						locationStr = loc.City
+					} else if loc.Region != "" {
+						locationStr = loc.Region
+					}
+					if loc.Country != "" {
+						if locationStr != "" {
+							locationStr += ", " + loc.Country
+						} else {
+							locationStr = loc.Country
+						}
+					}
+					if loc.Org != "" {
+						if locationStr != "" {
+							locationStr += " (" + loc.Org + ")"
+						} else {
+							locationStr = loc.Org
+						}
+					}
+					if locationStr != "" {
+						fmt.Printf("    └─ %s: %s\n", ip, locationStr)
+					}
+				}
+			}
 		}
 	}
 
@@ -643,11 +735,16 @@ func initDB(dbPath string) error {
 		domain TEXT NOT NULL,
 		subdomain TEXT NOT NULL,
 		ip_addresses TEXT NOT NULL,
+		ip_locations TEXT,
 		status_code INTEGER NOT NULL,
 		is_alive INTEGER NOT NULL,
 		environment TEXT NOT NULL,
 		FOREIGN KEY (domain) REFERENCES scans(domain) ON DELETE CASCADE
 	);`
+
+	// Add ip_locations column if it doesn't exist (for existing databases)
+	addLocationColumn := `
+	ALTER TABLE scan_results ADD COLUMN ip_locations TEXT;`
 
 	createIndex := `
 	CREATE INDEX IF NOT EXISTS idx_scan_results_domain ON scan_results(domain);`
@@ -659,6 +756,9 @@ func initDB(dbPath string) error {
 	if _, err := db.Exec(createResultsTable); err != nil {
 		return fmt.Errorf("failed to create scan_results table: %w", err)
 	}
+
+	// Try to add ip_locations column (will fail silently if it already exists)
+	_, _ = db.Exec(addLocationColumn)
 
 	if _, err := db.Exec(createIndex); err != nil {
 		return fmt.Errorf("failed to create index: %w", err)
@@ -734,7 +834,7 @@ func updateScan(domain string, results []SubdomainResult, scanErr error) error {
 
 	// Insert new results
 	stmt, err := tx.Prepare(
-		"INSERT INTO scan_results (domain, subdomain, ip_addresses, status_code, is_alive, environment) VALUES (?, ?, ?, ?, ?, ?)",
+		"INSERT INTO scan_results (domain, subdomain, ip_addresses, ip_locations, status_code, is_alive, environment) VALUES (?, ?, ?, ?, ?, ?, ?)",
 	)
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
@@ -743,6 +843,7 @@ func updateScan(domain string, results []SubdomainResult, scanErr error) error {
 
 	for _, result := range results {
 		ipAddressesJSON, _ := json.Marshal(result.IPAddresses)
+		ipLocationsJSON, _ := json.Marshal(result.IPLocations)
 		isAlive := 0
 		if result.IsAlive {
 			isAlive = 1
@@ -752,6 +853,7 @@ func updateScan(domain string, results []SubdomainResult, scanErr error) error {
 			domain,
 			result.Subdomain,
 			string(ipAddressesJSON),
+			string(ipLocationsJSON),
 			result.StatusCode,
 			isAlive,
 			result.Environment,
@@ -802,7 +904,7 @@ func getScan(domain string) (*ScanStatus, bool, error) {
 
 	// Load results
 	rows, err := db.Query(
-		"SELECT subdomain, ip_addresses, status_code, is_alive, environment FROM scan_results WHERE domain = ?",
+		"SELECT subdomain, ip_addresses, ip_locations, status_code, is_alive, environment FROM scan_results WHERE domain = ?",
 		domain,
 	)
 	if err != nil {
@@ -814,11 +916,13 @@ func getScan(domain string) (*ScanStatus, bool, error) {
 	for rows.Next() {
 		var result SubdomainResult
 		var ipAddressesJSON string
+		var ipLocationsJSON sql.NullString
 		var isAlive int
 
 		err := rows.Scan(
 			&result.Subdomain,
 			&ipAddressesJSON,
+			&ipLocationsJSON,
 			&result.StatusCode,
 			&isAlive,
 			&result.Environment,
@@ -829,6 +933,15 @@ func getScan(domain string) (*ScanStatus, bool, error) {
 
 		result.IsAlive = isAlive == 1
 		json.Unmarshal([]byte(ipAddressesJSON), &result.IPAddresses)
+
+		// Initialize IPLocations map
+		result.IPLocations = make(map[string]LocationInfo)
+
+		// Parse location data if available
+		if ipLocationsJSON.Valid && ipLocationsJSON.String != "" {
+			json.Unmarshal([]byte(ipLocationsJSON.String), &result.IPLocations)
+		}
+
 		results = append(results, result)
 	}
 
