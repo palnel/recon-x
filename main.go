@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -712,6 +713,24 @@ type ScanStatus struct {
 var db *sql.DB
 var dbMu sync.Mutex
 
+// Project represents a logical grouping of scopes (domains, IPs, etc.)
+type Project struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	Scopes      []Scope   `json:"scopes,omitempty"`
+}
+
+// Scope represents a single asset scope (domain or IP) that can be scanned
+type Scope struct {
+	ID        int64     `json:"id"`
+	ProjectID int64     `json:"project_id"`
+	Type      string    `json:"type"`  // "domain" or "ip"
+	Value     string    `json:"value"` // domain name or IP address
+	CreatedAt time.Time `json:"created_at"`
+}
+
 func initDB(dbPath string) error {
 	var err error
 	db, err = sql.Open("sqlite", dbPath)
@@ -742,12 +761,34 @@ func initDB(dbPath string) error {
 		FOREIGN KEY (domain) REFERENCES scans(domain) ON DELETE CASCADE
 	);`
 
+	createProjectsTable := `
+	CREATE TABLE IF NOT EXISTS projects (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		description TEXT,
+		created_at TEXT NOT NULL
+	);`
+
+	createScopesTable := `
+	CREATE TABLE IF NOT EXISTS scopes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL,
+		type TEXT NOT NULL,
+		value TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		UNIQUE(type, value),
+		FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+	);`
+
 	// Add ip_locations column if it doesn't exist (for existing databases)
 	addLocationColumn := `
 	ALTER TABLE scan_results ADD COLUMN ip_locations TEXT;`
 
 	createIndex := `
 	CREATE INDEX IF NOT EXISTS idx_scan_results_domain ON scan_results(domain);`
+
+	createScopesIndex := `
+	CREATE INDEX IF NOT EXISTS idx_scopes_project_id ON scopes(project_id);`
 
 	if _, err := db.Exec(createScansTable); err != nil {
 		return fmt.Errorf("failed to create scans table: %w", err)
@@ -757,11 +798,23 @@ func initDB(dbPath string) error {
 		return fmt.Errorf("failed to create scan_results table: %w", err)
 	}
 
+	if _, err := db.Exec(createProjectsTable); err != nil {
+		return fmt.Errorf("failed to create projects table: %w", err)
+	}
+
+	if _, err := db.Exec(createScopesTable); err != nil {
+		return fmt.Errorf("failed to create scopes table: %w", err)
+	}
+
 	// Try to add ip_locations column (will fail silently if it already exists)
 	_, _ = db.Exec(addLocationColumn)
 
 	if _, err := db.Exec(createIndex); err != nil {
 		return fmt.Errorf("failed to create index: %w", err)
+	}
+
+	if _, err := db.Exec(createScopesIndex); err != nil {
+		return fmt.Errorf("failed to create scopes index: %w", err)
 	}
 
 	return nil
@@ -1018,39 +1071,7 @@ func handleDiscover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Start scan in background
-	go func() {
-		discovery := NewDiscovery(req.Domain, req.Workers, timeoutDuration, req.ExpandSize)
-
-		if err := discovery.loadWordlist(req.Wordlist); err != nil {
-			if updateErr := updateScan(req.Domain, nil, err); updateErr != nil {
-				log.Printf("Failed to update scan error in database: %v", updateErr)
-			}
-			return
-		}
-
-		ctx := context.Background()
-
-		// Method 1: DNS bruteforce
-		discovery.dnsEnumeration(ctx)
-
-		// Method 2: Certificate Transparency logs
-		if useCT {
-			if err := discovery.ctLogsEnumeration(ctx); err != nil {
-				// Log error but continue
-				log.Printf("CT logs error for %s: %v", req.Domain, err)
-			}
-		}
-
-		// Method 3: Zone transfer attempt
-		if useAXFR {
-			discovery.attemptZoneTransfer()
-		}
-
-		// Update scan with results
-		if err := updateScan(req.Domain, discovery.results, nil); err != nil {
-			log.Printf("Failed to update scan in database: %v", err)
-		}
-	}()
+	startDiscoveryBackground(req.Domain, req.Wordlist, req.Workers, timeoutDuration, useCT, useAXFR, req.ExpandSize)
 
 	respondJSON(w, http.StatusAccepted, DiscoverResponse{
 		Message: "Discovery started",
@@ -1121,6 +1142,340 @@ func handleGetStatus(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, statusOnly)
 }
 
+// --- Projects & Scopes ---
+
+type createProjectRequest struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+type createScopeRequest struct {
+	ProjectID int64  `json:"project_id"`
+	Type      string `json:"type"`  // "domain" or "ip"
+	Value     string `json:"value"` // domain or IP
+}
+
+func handleProjects(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		getProjects(w, r)
+	case http.MethodPost:
+		createProject(w, r)
+	case http.MethodDelete:
+		deleteProject(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getProjects(w http.ResponseWriter, r *http.Request) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	rows, err := db.Query("SELECT id, name, description, created_at FROM projects ORDER BY created_at DESC")
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var projects []Project
+	for rows.Next() {
+		var (
+			id          int64
+			name        string
+			description sql.NullString
+			createdAt   string
+		)
+		if err := rows.Scan(&id, &name, &description, &createdAt); err != nil {
+			continue
+		}
+
+		p := Project{
+			ID:          id,
+			Name:        name,
+			Description: description.String,
+		}
+		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
+			p.CreatedAt = t
+		}
+
+		// Load scopes for this project
+		scopeRows, err := db.Query("SELECT id, project_id, type, value, created_at FROM scopes WHERE project_id = ? ORDER BY created_at ASC", id)
+		if err == nil {
+			defer scopeRows.Close()
+			for scopeRows.Next() {
+				var s Scope
+				var createdAtStr string
+				if err := scopeRows.Scan(&s.ID, &s.ProjectID, &s.Type, &s.Value, &createdAtStr); err != nil {
+					continue
+				}
+				if t, err := time.Parse(time.RFC3339, createdAtStr); err == nil {
+					s.CreatedAt = t
+				}
+				p.Scopes = append(p.Scopes, s)
+			}
+		}
+
+		projects = append(projects, p)
+	}
+
+	respondJSON(w, http.StatusOK, projects)
+}
+
+func createProject(w http.ResponseWriter, r *http.Request) {
+	var req createProjectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "Invalid JSON: " + err.Error()})
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "name is required"})
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+
+	dbMu.Lock()
+	res, err := db.Exec("INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?)", req.Name, req.Description, now)
+	dbMu.Unlock()
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+
+	id, _ := res.LastInsertId()
+	project := Project{
+		ID:          id,
+		Name:        req.Name,
+		Description: req.Description,
+	}
+	if t, err := time.Parse(time.RFC3339, now); err == nil {
+		project.CreatedAt = t
+	}
+
+	respondJSON(w, http.StatusCreated, project)
+}
+
+func deleteProject(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	if idStr == "" {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "id parameter is required"})
+		return
+	}
+	projectID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid id parameter"})
+		return
+	}
+
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	// Delete scans associated with all scopes of this project
+	scopeRows, err := db.Query("SELECT value FROM scopes WHERE project_id = ?", projectID)
+	if err == nil {
+		defer scopeRows.Close()
+		for scopeRows.Next() {
+			var value string
+			if err := scopeRows.Scan(&value); err != nil {
+				continue
+			}
+			_, _ = db.Exec("DELETE FROM scans WHERE domain = ?", value)
+		}
+	}
+
+	// Delete project (scopes will be removed via FK cascade)
+	if _, err := db.Exec("DELETE FROM projects WHERE id = ?", projectID); err != nil {
+		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleScopes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		createScope(w, r)
+	case http.MethodDelete:
+		deleteScope(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func createScope(w http.ResponseWriter, r *http.Request) {
+	var req createScopeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "Invalid JSON: " + err.Error()})
+		return
+	}
+
+	if req.ProjectID == 0 {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "project_id is required"})
+		return
+	}
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	req.Value = strings.TrimSpace(req.Value)
+	if req.Type != "domain" && req.Type != "ip" {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "type must be 'domain' or 'ip'"})
+		return
+	}
+	if req.Value == "" {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "value is required"})
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+
+	dbMu.Lock()
+	res, err := db.Exec(
+		"INSERT INTO scopes (project_id, type, value, created_at) VALUES (?, ?, ?, ?)",
+		req.ProjectID, req.Type, req.Value, now,
+	)
+	dbMu.Unlock()
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+
+	scopeID, _ := res.LastInsertId()
+	scope := Scope{
+		ID:        scopeID,
+		ProjectID: req.ProjectID,
+		Type:      req.Type,
+		Value:     req.Value,
+	}
+	if t, err := time.Parse(time.RFC3339, now); err == nil {
+		scope.CreatedAt = t
+	}
+
+	// Start a scan for this scope
+	started, err := startScan(req.Value)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+	if !started {
+		respondJSON(w, http.StatusConflict, ErrorResponse{Error: "Scan already running for this scope"})
+		return
+	}
+
+	// Background scan depending on scope type
+	if req.Type == "domain" {
+		startDiscoveryBackground(req.Value, "", 50, 3*time.Second, true, true, 0)
+	} else if req.Type == "ip" {
+		startIPScanBackground(req.Value, 3*time.Second)
+	}
+
+	respondJSON(w, http.StatusCreated, scope)
+}
+
+func deleteScope(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	if idStr == "" {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "id parameter is required"})
+		return
+	}
+	scopeID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid id parameter"})
+		return
+	}
+
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	// Find scope value so we can delete its assets
+	var value string
+	err = db.QueryRow("SELECT value FROM scopes WHERE id = ?", scopeID).Scan(&value)
+	if err == sql.ErrNoRows {
+		respondJSON(w, http.StatusNotFound, ErrorResponse{Error: "scope not found"})
+		return
+	} else if err != nil {
+		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+
+	// Delete scans (assets) for this scope; scan_results will cascade
+	_, _ = db.Exec("DELETE FROM scans WHERE domain = ?", value)
+
+	// Delete scope itself
+	if _, err := db.Exec("DELETE FROM scopes WHERE id = ?", scopeID); err != nil {
+		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// startDiscoveryBackground starts a domain discovery scan in the background.
+func startDiscoveryBackground(domain, wordlist string, workers int, timeout time.Duration, useCT, useAXFR bool, expandSize int) {
+	go func() {
+		discovery := NewDiscovery(domain, workers, timeout, expandSize)
+
+		if err := discovery.loadWordlist(wordlist); err != nil {
+			if updateErr := updateScan(domain, nil, err); updateErr != nil {
+				log.Printf("Failed to update scan error in database: %v", updateErr)
+			}
+			return
+		}
+
+		ctx := context.Background()
+
+		// Method 1: DNS bruteforce
+		discovery.dnsEnumeration(ctx)
+
+		// Method 2: Certificate Transparency logs
+		if useCT {
+			if err := discovery.ctLogsEnumeration(ctx); err != nil {
+				// Log error but continue
+				log.Printf("CT logs error for %s: %v", domain, err)
+			}
+		}
+
+		// Method 3: Zone transfer attempt
+		if useAXFR {
+			discovery.attemptZoneTransfer()
+		}
+
+		// Update scan with results
+		if err := updateScan(domain, discovery.results, nil); err != nil {
+			log.Printf("Failed to update scan in database: %v", err)
+		}
+	}()
+}
+
+// startIPScanBackground starts a simple IP scan (HTTP probe + geolocation) in the background.
+func startIPScanBackground(ip string, timeout time.Duration) {
+	go func() {
+		discovery := NewDiscovery(ip, 1, timeout, 0)
+		ctx := context.Background()
+
+		result := SubdomainResult{
+			Subdomain:   ip,
+			IPAddresses: []string{ip},
+			IPLocations: make(map[string]LocationInfo),
+			IsAlive:     false,
+			Environment: "unknown",
+		}
+
+		if loc := discovery.fetchIPLocation(ctx, ip); loc != nil {
+			result.IPLocations[ip] = *loc
+		}
+
+		if discovery.probeHTTP(ip, &result) {
+			result.IsAlive = true
+		}
+
+		if err := updateScan(ip, []SubdomainResult{result}, nil); err != nil {
+			log.Printf("Failed to update IP scan in database: %v", err)
+		}
+	}()
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1165,6 +1520,8 @@ func startServer(port string, dbPath string) {
 	http.HandleFunc("/api/discover", corsMiddleware(handleDiscover))
 	http.HandleFunc("/api/results", corsMiddleware(handleGetResults))
 	http.HandleFunc("/api/status", corsMiddleware(handleGetStatus))
+	http.HandleFunc("/api/projects", corsMiddleware(handleProjects))
+	http.HandleFunc("/api/scopes", corsMiddleware(handleScopes))
 	http.HandleFunc("/health", corsMiddleware(handleHealth))
 
 	addr := ":" + port
