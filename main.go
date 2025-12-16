@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/miekg/dns"
-	_ "modernc.org/sqlite"
 )
 
 type LocationInfo struct {
@@ -731,11 +731,16 @@ type Scope struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func initDB(dbPath string) error {
+func initDB(connString string) error {
 	var err error
-	db, err = sql.Open("sqlite", dbPath)
+	db, err = sql.Open("postgres", connString)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Test the connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
 	}
 
 	// Create tables
@@ -743,14 +748,14 @@ func initDB(dbPath string) error {
 	CREATE TABLE IF NOT EXISTS scans (
 		domain TEXT PRIMARY KEY,
 		status TEXT NOT NULL,
-		started_at TEXT NOT NULL,
-		completed_at TEXT,
+		started_at TIMESTAMP NOT NULL,
+		completed_at TIMESTAMP,
 		error TEXT
 	);`
 
 	createResultsTable := `
 	CREATE TABLE IF NOT EXISTS scan_results (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id SERIAL PRIMARY KEY,
 		domain TEXT NOT NULL,
 		subdomain TEXT NOT NULL,
 		ip_addresses TEXT NOT NULL,
@@ -763,26 +768,34 @@ func initDB(dbPath string) error {
 
 	createProjectsTable := `
 	CREATE TABLE IF NOT EXISTS projects (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id SERIAL PRIMARY KEY,
 		name TEXT NOT NULL,
 		description TEXT,
-		created_at TEXT NOT NULL
+		created_at TIMESTAMP NOT NULL
 	);`
 
 	createScopesTable := `
 	CREATE TABLE IF NOT EXISTS scopes (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id SERIAL PRIMARY KEY,
 		project_id INTEGER NOT NULL,
 		type TEXT NOT NULL,
 		value TEXT NOT NULL,
-		created_at TEXT NOT NULL,
+		created_at TIMESTAMP NOT NULL,
 		UNIQUE(type, value),
 		FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 	);`
 
 	// Add ip_locations column if it doesn't exist (for existing databases)
 	addLocationColumn := `
-	ALTER TABLE scan_results ADD COLUMN ip_locations TEXT;`
+	DO $$ 
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM information_schema.columns 
+			WHERE table_name = 'scan_results' AND column_name = 'ip_locations'
+		) THEN
+			ALTER TABLE scan_results ADD COLUMN ip_locations TEXT;
+		END IF;
+	END $$;`
 
 	createIndex := `
 	CREATE INDEX IF NOT EXISTS idx_scan_results_domain ON scan_results(domain);`
@@ -826,22 +839,22 @@ func startScan(domain string) (bool, error) {
 
 	// Check if scan already exists and is running
 	var status string
-	err := db.QueryRow("SELECT status FROM scans WHERE domain = ?", domain).Scan(&status)
+	err := db.QueryRow("SELECT status FROM scans WHERE domain = $1", domain).Scan(&status)
 	if err == nil {
 		if status == "running" {
 			return false, nil // Already running
 		}
 		// If exists but not running, delete old scan and results
-		_, _ = db.Exec("DELETE FROM scan_results WHERE domain = ?", domain)
-		_, _ = db.Exec("DELETE FROM scans WHERE domain = ?", domain)
+		_, _ = db.Exec("DELETE FROM scan_results WHERE domain = $1", domain)
+		_, _ = db.Exec("DELETE FROM scans WHERE domain = $1", domain)
 	} else if err != sql.ErrNoRows {
 		return false, fmt.Errorf("database error: %w", err)
 	}
 
 	// Insert new scan
 	_, err = db.Exec(
-		"INSERT INTO scans (domain, status, started_at) VALUES (?, ?, ?)",
-		domain, "running", time.Now().Format(time.RFC3339),
+		"INSERT INTO scans (domain, status, started_at) VALUES ($1, $2, $3)",
+		domain, "running", time.Now(),
 	)
 	if err != nil {
 		return false, fmt.Errorf("failed to insert scan: %w", err)
@@ -863,31 +876,41 @@ func updateScan(domain string, results []SubdomainResult, scanErr error) error {
 	// Update scan status
 	status := "completed"
 	errorMsg := ""
-	completedAt := time.Now().Format(time.RFC3339)
+	var completedAt *time.Time
 
 	if scanErr != nil {
 		status = "error"
 		errorMsg = scanErr.Error()
-		completedAt = ""
+		completedAt = nil
+	} else {
+		now := time.Now()
+		completedAt = &now
 	}
 
-	_, err = tx.Exec(
-		"UPDATE scans SET status = ?, completed_at = ?, error = ? WHERE domain = ?",
-		status, completedAt, errorMsg, domain,
-	)
+	if scanErr != nil {
+		_, err = tx.Exec(
+			"UPDATE scans SET status = $1, completed_at = NULL, error = $2 WHERE domain = $3",
+			status, errorMsg, domain,
+		)
+	} else {
+		_, err = tx.Exec(
+			"UPDATE scans SET status = $1, completed_at = $2, error = $3 WHERE domain = $4",
+			status, completedAt, errorMsg, domain,
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to update scan: %w", err)
 	}
 
 	// Delete old results
-	_, err = tx.Exec("DELETE FROM scan_results WHERE domain = ?", domain)
+	_, err = tx.Exec("DELETE FROM scan_results WHERE domain = $1", domain)
 	if err != nil {
 		return fmt.Errorf("failed to delete old results: %w", err)
 	}
 
 	// Insert new results
 	stmt, err := tx.Prepare(
-		"INSERT INTO scan_results (domain, subdomain, ip_addresses, ip_locations, status_code, is_alive, environment) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO scan_results (domain, subdomain, ip_addresses, ip_locations, status_code, is_alive, environment) VALUES ($1, $2, $3, $4, $5, $6, $7)",
 	)
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
@@ -923,11 +946,14 @@ func getScan(domain string) (*ScanStatus, bool, error) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
-	var status, startedAtStr, completedAtStr, errorMsg sql.NullString
+	var status string
+	var startedAt time.Time
+	var completedAt sql.NullTime
+	var errorMsg sql.NullString
 	err := db.QueryRow(
-		"SELECT status, started_at, completed_at, error FROM scans WHERE domain = ?",
+		"SELECT status, started_at, completed_at, error FROM scans WHERE domain = $1",
 		domain,
-	).Scan(&status, &startedAtStr, &completedAtStr, &errorMsg)
+	).Scan(&status, &startedAt, &completedAt, &errorMsg)
 
 	if err == sql.ErrNoRows {
 		return nil, false, nil
@@ -936,28 +962,20 @@ func getScan(domain string) (*ScanStatus, bool, error) {
 		return nil, false, fmt.Errorf("database error: %w", err)
 	}
 
-	startedAt, err := time.Parse(time.RFC3339, startedAtStr.String)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to parse started_at: %w", err)
-	}
-
 	scan := &ScanStatus{
 		Domain:    domain,
-		Status:    status.String,
+		Status:    status,
 		StartedAt: startedAt,
 		Error:     errorMsg.String,
 	}
 
-	if completedAtStr.Valid && completedAtStr.String != "" {
-		completedAt, err := time.Parse(time.RFC3339, completedAtStr.String)
-		if err == nil {
-			scan.CompletedAt = &completedAt
-		}
+	if completedAt.Valid {
+		scan.CompletedAt = &completedAt.Time
 	}
 
 	// Load results
 	rows, err := db.Query(
-		"SELECT subdomain, ip_addresses, ip_locations, status_code, is_alive, environment FROM scan_results WHERE domain = ?",
+		"SELECT subdomain, ip_addresses, ip_locations, status_code, is_alive, environment FROM scan_results WHERE domain = $1",
 		domain,
 	)
 	if err != nil {
@@ -1168,7 +1186,7 @@ func handleProjects(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getProjects(w http.ResponseWriter, r *http.Request) {
+func getProjects(w http.ResponseWriter, _ *http.Request) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
@@ -1185,7 +1203,7 @@ func getProjects(w http.ResponseWriter, r *http.Request) {
 			id          int64
 			name        string
 			description sql.NullString
-			createdAt   string
+			createdAt   time.Time
 		)
 		if err := rows.Scan(&id, &name, &description, &createdAt); err != nil {
 			continue
@@ -1195,24 +1213,20 @@ func getProjects(w http.ResponseWriter, r *http.Request) {
 			ID:          id,
 			Name:        name,
 			Description: description.String,
-		}
-		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
-			p.CreatedAt = t
+			CreatedAt:   createdAt,
 		}
 
 		// Load scopes for this project
-		scopeRows, err := db.Query("SELECT id, project_id, type, value, created_at FROM scopes WHERE project_id = ? ORDER BY created_at ASC", id)
+		scopeRows, err := db.Query("SELECT id, project_id, type, value, created_at FROM scopes WHERE project_id = $1 ORDER BY created_at ASC", id)
 		if err == nil {
 			defer scopeRows.Close()
 			for scopeRows.Next() {
 				var s Scope
-				var createdAtStr string
-				if err := scopeRows.Scan(&s.ID, &s.ProjectID, &s.Type, &s.Value, &createdAtStr); err != nil {
+				var createdAtTime time.Time
+				if err := scopeRows.Scan(&s.ID, &s.ProjectID, &s.Type, &s.Value, &createdAtTime); err != nil {
 					continue
 				}
-				if t, err := time.Parse(time.RFC3339, createdAtStr); err == nil {
-					s.CreatedAt = t
-				}
+				s.CreatedAt = createdAtTime
 				p.Scopes = append(p.Scopes, s)
 			}
 		}
@@ -1235,10 +1249,10 @@ func createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now()
 
 	dbMu.Lock()
-	res, err := db.Exec("INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?)", req.Name, req.Description, now)
+	res, err := db.Exec("INSERT INTO projects (name, description, created_at) VALUES ($1, $2, $3)", req.Name, req.Description, now)
 	dbMu.Unlock()
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
@@ -1250,9 +1264,7 @@ func createProject(w http.ResponseWriter, r *http.Request) {
 		ID:          id,
 		Name:        req.Name,
 		Description: req.Description,
-	}
-	if t, err := time.Parse(time.RFC3339, now); err == nil {
-		project.CreatedAt = t
+		CreatedAt:   now,
 	}
 
 	respondJSON(w, http.StatusCreated, project)
@@ -1274,7 +1286,7 @@ func deleteProject(w http.ResponseWriter, r *http.Request) {
 	defer dbMu.Unlock()
 
 	// Delete scans associated with all scopes of this project
-	scopeRows, err := db.Query("SELECT value FROM scopes WHERE project_id = ?", projectID)
+	scopeRows, err := db.Query("SELECT value FROM scopes WHERE project_id = $1", projectID)
 	if err == nil {
 		defer scopeRows.Close()
 		for scopeRows.Next() {
@@ -1282,12 +1294,12 @@ func deleteProject(w http.ResponseWriter, r *http.Request) {
 			if err := scopeRows.Scan(&value); err != nil {
 				continue
 			}
-			_, _ = db.Exec("DELETE FROM scans WHERE domain = ?", value)
+			_, _ = db.Exec("DELETE FROM scans WHERE domain = $1", value)
 		}
 	}
 
 	// Delete project (scopes will be removed via FK cascade)
-	if _, err := db.Exec("DELETE FROM projects WHERE id = ?", projectID); err != nil {
+	if _, err := db.Exec("DELETE FROM projects WHERE id = $1", projectID); err != nil {
 		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
 		return
 	}
@@ -1328,11 +1340,11 @@ func createScope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now()
 
 	dbMu.Lock()
 	res, err := db.Exec(
-		"INSERT INTO scopes (project_id, type, value, created_at) VALUES (?, ?, ?, ?)",
+		"INSERT INTO scopes (project_id, type, value, created_at) VALUES ($1, $2, $3, $4)",
 		req.ProjectID, req.Type, req.Value, now,
 	)
 	dbMu.Unlock()
@@ -1347,9 +1359,7 @@ func createScope(w http.ResponseWriter, r *http.Request) {
 		ProjectID: req.ProjectID,
 		Type:      req.Type,
 		Value:     req.Value,
-	}
-	if t, err := time.Parse(time.RFC3339, now); err == nil {
-		scope.CreatedAt = t
+		CreatedAt: now,
 	}
 
 	// Start a scan for this scope
@@ -1390,7 +1400,7 @@ func deleteScope(w http.ResponseWriter, r *http.Request) {
 
 	// Find scope value so we can delete its assets
 	var value string
-	err = db.QueryRow("SELECT value FROM scopes WHERE id = ?", scopeID).Scan(&value)
+	err = db.QueryRow("SELECT value FROM scopes WHERE id = $1", scopeID).Scan(&value)
 	if err == sql.ErrNoRows {
 		respondJSON(w, http.StatusNotFound, ErrorResponse{Error: "scope not found"})
 		return
@@ -1400,10 +1410,10 @@ func deleteScope(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete scans (assets) for this scope; scan_results will cascade
-	_, _ = db.Exec("DELETE FROM scans WHERE domain = ?", value)
+	_, _ = db.Exec("DELETE FROM scans WHERE domain = $1", value)
 
 	// Delete scope itself
-	if _, err := db.Exec("DELETE FROM scopes WHERE id = ?", scopeID); err != nil {
+	if _, err := db.Exec("DELETE FROM scopes WHERE id = $1", scopeID); err != nil {
 		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
 		return
 	}
@@ -1489,7 +1499,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Set CORS headers
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "3600")
 
@@ -1510,9 +1520,9 @@ func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func startServer(port string, dbPath string) {
+func startServer(port string, connString string) {
 	// Initialize database
-	if err := initDB(dbPath); err != nil {
+	if err := initDB(connString); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer db.Close()
@@ -1526,7 +1536,7 @@ func startServer(port string, dbPath string) {
 
 	addr := ":" + port
 	fmt.Printf("[*] Starting REST API server on http://localhost%s\n", addr)
-	fmt.Printf("[*] Database: %s\n", dbPath)
+	fmt.Printf("[*] Database: PostgreSQL\n")
 	fmt.Printf("[*] Endpoints:\n")
 	fmt.Printf("    POST   /api/discover - Start a discovery scan\n")
 	fmt.Printf("    GET    /api/results?domain=example.com - Get full results\n")
@@ -1548,13 +1558,16 @@ func main() {
 	expandSize := flag.Int("n", 0, "Expand default wordlist to N entries (numeric suffixes)")
 	server := flag.Bool("server", false, "Start REST API server instead of CLI mode")
 	port := flag.String("port", "8080", "Port for REST API server (default: 8080)")
-	dbPath := flag.String("db", "recon-x.db", "SQLite database file path (default: recon-x.db)")
 
 	flag.Parse()
 
 	// If server mode, start the API server
 	if *server {
-		startServer(*port, *dbPath)
+		connString := os.Getenv("DATABASE_URL")
+		if connString == "" {
+			log.Fatal("DATABASE_URL environment variable is required when running in server mode")
+		}
+		startServer(*port, connString)
 		return
 	}
 
