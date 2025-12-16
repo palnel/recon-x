@@ -39,6 +39,12 @@ WORKDIR /app
 # Copy binary from builder stage
 COPY --from=builder /build/recon-x .
 
+# Copy entrypoint script
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+
+# Make entrypoint script executable
+RUN chmod +x /app/docker-entrypoint.sh
+
 # Change ownership to non-root user
 RUN chown -R appuser:appgroup /app
 
@@ -55,8 +61,8 @@ ENV PORT=8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT}/health || exit 1
 
-# Run the application in server mode
+# Run the application using entrypoint script
 # DATABASE_URL must be provided as environment variable
 # PORT can be overridden via environment variable
-CMD sh -c "./recon-x -server -port ${PORT:-8080}"
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
