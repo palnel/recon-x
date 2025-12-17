@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/clerk/clerk-sdk-go/v2"
+	"github.com/clerk/clerk-sdk-go/v2/jwt"
 	_ "github.com/lib/pq"
 	"github.com/miekg/dns"
 )
@@ -716,6 +718,7 @@ var dbMu sync.Mutex
 // Project represents a logical grouping of scopes (domains, IPs, etc.)
 type Project struct {
 	ID          int64     `json:"id"`
+	UserID      string    `json:"user_id"`
 	Name        string    `json:"name"`
 	Description string    `json:"description,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -769,10 +772,22 @@ func initDB(connString string) error {
 	createProjectsTable := `
 	CREATE TABLE IF NOT EXISTS projects (
 		id SERIAL PRIMARY KEY,
+		user_id TEXT NOT NULL,
 		name TEXT NOT NULL,
 		description TEXT,
 		created_at TIMESTAMP NOT NULL
 	);`
+
+	addUserIdColumn := `
+	DO $$ 
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM information_schema.columns 
+			WHERE table_name = 'projects' AND column_name = 'user_id'
+		) THEN
+			ALTER TABLE projects ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+		END IF;
+	END $$;`
 
 	createScopesTable := `
 	CREATE TABLE IF NOT EXISTS scopes (
@@ -821,6 +836,9 @@ func initDB(connString string) error {
 
 	// Try to add ip_locations column (will fail silently if it already exists)
 	_, _ = db.Exec(addLocationColumn)
+
+	// Try to add user_id column to projects
+	_, _ = db.Exec(addUserIdColumn)
 
 	if _, err := db.Exec(createIndex); err != nil {
 		return fmt.Errorf("failed to create index: %w", err)
@@ -1186,11 +1204,24 @@ func handleProjects(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getProjects(w http.ResponseWriter, _ *http.Request) {
+func getUserID(r *http.Request) string {
+	if userID, ok := r.Context().Value("clerk_user_id").(string); ok {
+		return userID
+	}
+	return ""
+}
+
+func getProjects(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "User not authenticated"})
+		return
+	}
+
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
-	rows, err := db.Query("SELECT id, name, description, created_at FROM projects ORDER BY created_at DESC")
+	rows, err := db.Query("SELECT id, user_id, name, description, created_at FROM projects WHERE user_id = $1 ORDER BY created_at DESC", userID)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
 		return
@@ -1201,16 +1232,18 @@ func getProjects(w http.ResponseWriter, _ *http.Request) {
 	for rows.Next() {
 		var (
 			id          int64
+			dbUserID    string
 			name        string
 			description sql.NullString
 			createdAt   time.Time
 		)
-		if err := rows.Scan(&id, &name, &description, &createdAt); err != nil {
+		if err := rows.Scan(&id, &dbUserID, &name, &description, &createdAt); err != nil {
 			continue
 		}
 
 		p := Project{
 			ID:          id,
+			UserID:      dbUserID,
 			Name:        name,
 			Description: description.String,
 			CreatedAt:   createdAt,
@@ -1238,6 +1271,12 @@ func getProjects(w http.ResponseWriter, _ *http.Request) {
 }
 
 func createProject(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "User not authenticated"})
+		return
+	}
+
 	var req createProjectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "Invalid JSON: " + err.Error()})
@@ -1252,16 +1291,17 @@ func createProject(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 
 	dbMu.Lock()
-	res, err := db.Exec("INSERT INTO projects (name, description, created_at) VALUES ($1, $2, $3)", req.Name, req.Description, now)
+	var id int64
+	err := db.QueryRow("INSERT INTO projects (user_id, name, description, created_at) VALUES ($1, $2, $3, $4) RETURNING id", userID, req.Name, req.Description, now).Scan(&id)
 	dbMu.Unlock()
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
 		return
 	}
 
-	id, _ := res.LastInsertId()
 	project := Project{
 		ID:          id,
+		UserID:      userID,
 		Name:        req.Name,
 		Description: req.Description,
 		CreatedAt:   now,
@@ -1271,6 +1311,12 @@ func createProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func deleteProject(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "User not authenticated"})
+		return
+	}
+
 	idStr := r.URL.Query().Get("id")
 	if idStr == "" {
 		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "id parameter is required"})
@@ -1284,6 +1330,18 @@ func deleteProject(w http.ResponseWriter, r *http.Request) {
 
 	dbMu.Lock()
 	defer dbMu.Unlock()
+
+	// Verify user owns this project
+	var ownerID string
+	err = db.QueryRow("SELECT user_id FROM projects WHERE id = $1", projectID).Scan(&ownerID)
+	if err == sql.ErrNoRows {
+		respondJSON(w, http.StatusNotFound, ErrorResponse{Error: "project not found"})
+		return
+	}
+	if ownerID != userID {
+		respondJSON(w, http.StatusForbidden, ErrorResponse{Error: "access denied"})
+		return
+	}
 
 	// Delete scans associated with all scopes of this project
 	scopeRows, err := db.Query("SELECT value FROM scopes WHERE project_id = $1", projectID)
@@ -1319,6 +1377,12 @@ func handleScopes(w http.ResponseWriter, r *http.Request) {
 }
 
 func createScope(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "User not authenticated"})
+		return
+	}
+
 	var req createScopeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "Invalid JSON: " + err.Error()})
@@ -1340,20 +1404,32 @@ func createScope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify user owns the project
+	var ownerID string
+	err := db.QueryRow("SELECT user_id FROM projects WHERE id = $1", req.ProjectID).Scan(&ownerID)
+	if err == sql.ErrNoRows {
+		respondJSON(w, http.StatusNotFound, ErrorResponse{Error: "project not found"})
+		return
+	}
+	if ownerID != userID {
+		respondJSON(w, http.StatusForbidden, ErrorResponse{Error: "access denied"})
+		return
+	}
+
 	now := time.Now()
 
 	dbMu.Lock()
-	res, err := db.Exec(
-		"INSERT INTO scopes (project_id, type, value, created_at) VALUES ($1, $2, $3, $4)",
+	var scopeID int64
+	err = db.QueryRow(
+		"INSERT INTO scopes (project_id, type, value, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
 		req.ProjectID, req.Type, req.Value, now,
-	)
+	).Scan(&scopeID)
 	dbMu.Unlock()
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
 		return
 	}
 
-	scopeID, _ := res.LastInsertId()
 	scope := Scope{
 		ID:        scopeID,
 		ProjectID: req.ProjectID,
@@ -1384,6 +1460,12 @@ func createScope(w http.ResponseWriter, r *http.Request) {
 }
 
 func deleteScope(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "User not authenticated"})
+		return
+	}
+
 	idStr := r.URL.Query().Get("id")
 	if idStr == "" {
 		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "id parameter is required"})
@@ -1398,14 +1480,23 @@ func deleteScope(w http.ResponseWriter, r *http.Request) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
-	// Find scope value so we can delete its assets
+	// Find scope and verify ownership via project
 	var value string
-	err = db.QueryRow("SELECT value FROM scopes WHERE id = $1", scopeID).Scan(&value)
+	var ownerID string
+	err = db.QueryRow(`
+		SELECT s.value, p.user_id 
+		FROM scopes s 
+		JOIN projects p ON s.project_id = p.id 
+		WHERE s.id = $1`, scopeID).Scan(&value, &ownerID)
 	if err == sql.ErrNoRows {
 		respondJSON(w, http.StatusNotFound, ErrorResponse{Error: "scope not found"})
 		return
 	} else if err != nil {
 		respondJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "Database error: " + err.Error()})
+		return
+	}
+	if ownerID != userID {
+		respondJSON(w, http.StatusForbidden, ErrorResponse{Error: "access denied"})
 		return
 	}
 
@@ -1514,6 +1605,36 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Extract Bearer token from Authorization header
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "Missing Authorization header"})
+			return
+		}
+
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if token == authHeader {
+			respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "Invalid Authorization header format"})
+			return
+		}
+
+		// Verify the JWT token with Clerk
+		claims, err := jwt.Verify(r.Context(), &jwt.VerifyParams{
+			Token: token,
+		})
+		if err != nil {
+			respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "Invalid token: " + err.Error()})
+			return
+		}
+
+		// Add user ID to context
+		ctx := context.WithValue(r.Context(), "clerk_user_id", claims.Subject)
+		next(w, r.WithContext(ctx))
+	}
+}
+
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1521,17 +1642,26 @@ func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 }
 
 func startServer(port string, connString string) {
+	// Initialize Clerk with secret key
+	clerkSecretKey := os.Getenv("CLERK_SECRET_KEY")
+	if clerkSecretKey == "" {
+		log.Fatal("CLERK_SECRET_KEY environment variable is required")
+	}
+	clerk.SetKey(clerkSecretKey)
+
 	// Initialize database
 	if err := initDB(connString); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer db.Close()
 
-	http.HandleFunc("/api/discover", corsMiddleware(handleDiscover))
-	http.HandleFunc("/api/results", corsMiddleware(handleGetResults))
-	http.HandleFunc("/api/status", corsMiddleware(handleGetStatus))
-	http.HandleFunc("/api/projects", corsMiddleware(handleProjects))
-	http.HandleFunc("/api/scopes", corsMiddleware(handleScopes))
+	// Protected routes (require auth)
+	http.HandleFunc("/api/discover", corsMiddleware(authMiddleware(handleDiscover)))
+	http.HandleFunc("/api/results", corsMiddleware(authMiddleware(handleGetResults)))
+	http.HandleFunc("/api/status", corsMiddleware(authMiddleware(handleGetStatus)))
+	http.HandleFunc("/api/projects", corsMiddleware(authMiddleware(handleProjects)))
+	http.HandleFunc("/api/scopes", corsMiddleware(authMiddleware(handleScopes)))
+	// Public routes
 	http.HandleFunc("/health", corsMiddleware(handleHealth))
 
 	addr := ":" + port
